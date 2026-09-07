@@ -10,6 +10,12 @@
 -->
 # dsh-download-pro
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-download-pro"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 资源下载插件：**aria2 RPC 引擎**，磁力/BT/HTTP 直链下载管理。
 与 dsh-search-pro 配套——搜索找到资源（磁力/直链）→ 本插件真正下载到本地。
 
