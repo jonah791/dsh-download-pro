@@ -147,17 +147,52 @@ src/aria2.ts  Aria2Client
 | A7 | removeFiles 删文件且只删空目录 | 造一个单文件任务 → `remove+removeFiles=true` → 文件消失；若目录内另有他文件则目录保留 | 待验收 |
 | A8 | 非法 url 被拒 | `download_add url=ftp://x` → `ok:false` 且 error 明示 `magnet:`/`http(s)://` | 待验收 |
 | A9 | 限速 0 = 不限 | `download_global downloadLimit=0` → aria2 返回该任务 `max-overall-download-limit:0` | 待验收（需 RPC 直查） |
+| A10 | spawn 失败不再打崩宿主（未处理 `'error'` 事件） | `npm test` → `tests/spawn-contract.test.mjs`：**尸体测试**用真实子进程证明「spawn 失败 + 无监听器 = 非零退出 + ENOENT」，对照测试证明「注册监听器 = 不崩」；静态守卫要求每个 `spawn('…'` 调用点消费 `'error'` | **已实测（2026-09-14，44/44 pass）** |
+| A11 | daemon argv 的安全与生命周期不变量 | `npm test` → `tests/logic.test.mjs:buildDaemonArgs`：`--rpc-listen-all=false` 必在、secret 透传、DHT/BT 监听端口不在 Windows 排除段 6644-7043、`--save-session` 路径**不含反斜杠**、每个 argv 元素独立（不拼 shell 串） | **已实测（2026-09-14）** |
+| A12 | 纯逻辑有失败/退化路径覆盖 | `npm test` → `tests/logic.test.mjs` 30 例：0/NaN/负数/Infinity 格式化、脏类型（`files:{}`）、缺字段、空 secret、`errorCode=0`、未知 action、非 JSON RPC body 等 | **已实测（2026-09-14）** |
+| A13 | `seed=true` 是空操作（原「语义相反」猜想被证实并加强） | `npm test` → 断言 `buildAddOptions({seed:true})['seed-time']` 与 daemon 的 `--seed-time=0` **逐字节相同** → 对行为零影响 | **已实测（2026-09-14）** |
+| A14 | `logic.ts` 保持纯逻辑（可离线单测） | `npm test` → 断言 `src/logic.ts` 不含 `child_process`、不含 `fetch(` | **已实测（2026-09-14）** |
 
 ## 8 · 与实现的关系
 
-- 主实现：`src/index.ts`（313 行，工具面 + `safe()` + 删除逻辑）、`src/aria2.ts`（271 行，RPC 客户端 + daemon 管理 + 任务映射）。
+- 主实现：`src/index.ts`（工具面 + `safe()` + 删除逻辑）、`src/aria2.ts`（RPC 客户端 + daemon 管理 + 进程生命周期）、`src/logic.ts`（**纯逻辑层**：格式化/argv 拼装/RPC 载荷/任务映射/错误文案）。
 - 同语义副本：无。aria2 自身的 `--option` 语义不在本文管辖。
 - 未实现/未验证部分**显式标注**：
-  - **无 `tests/`**：A1–A9 全部待验收。
-  - `spawn()` 的 30+ 个 aria2 参数（BT tracker 列表、DHT entry point、`--bt-max-peers=300`、`--split=16` …）是**经验值**，无单测覆盖；其效果只能由实际下载成功率观察（属「经验参数」而非契约）。
-  - 工具 `download_add` 的 `seed=true` 分支写 `options['seed-time']='0'`，而 spawn 全局已含 `--seed-time=0`——**语义疑似相反**（aria2 中 `seed-time=0` = 完成后不做种），见 §10 U1。
+  - **单测（2026-09-14 补课已补）**：`tests/logic.test.mjs`（30）+ `tests/spawn-contract.test.mjs`（14）= **44/44 全过**；`npm test` 一条命令可复跑。A1–A9 仍需**真实 aria2 daemon** 的线上验收（离线单测不能替代）。
+  - `spawn()` 的 29 条 aria2 参数（BT tracker 列表、DHT entry point、`--bt-max-peers=300`、`--split=16` …）是**经验值**：其**拼装正确性**现已被单测锁住（A11），但**效果**只能由实际下载成功率观察（属「经验参数」而非契约）。
+  - 工具 `download_add` 的 `seed=true` 分支写 `options['seed-time']='0'`，而 spawn 全局已含 `--seed-time=0`——**已由单测证伪为「空操作」**（不是「做种」也不是「相反」，而是**零影响**），见 §10 U1。
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 · 进程崩溃缺陷：spawn 失败无 `'error'` 监听器 → 打崩宿主 web（已修 + 加机器守卫）**
+  - **症状**：`src/aria2.ts:spawn()` 用 `spawn('aria2c', args, …)` 拉起 daemon，**从未注册 `'error'` 监听器**。
+    spawn 失败（`aria2c` 不在 PATH = ENOENT、EACCES）时 Node 在 ChildProcess 上 emit `'error'`；
+    无监听器 ⇒ 该事件被抛成未捕获异常 ⇒ **宿主 web 进程崩溃**。而 `apply()` 在装载时就预热
+    `aria2.ensure()` ⇒ **「没装 aria2c 的机器上挂载本插件 = web 起不来」**（守护会反复拉起 → 重启循环）。
+  - **证伪证据（修前）**：`tests/spawn-contract.test.mjs` 的尸体测试用真实子进程复刻该形态——
+    `spawn('dsh-definitely-not-a-real-binary-xyz', …)` 不注册监听器 → `status≠0` 且 stderr 含 `ENOENT`；
+    对照组（注册 `'error'` 监听器）→ `status=0` 并打印 `CONSUMED`。
+  - **修复**：`spawn()` 注册 `proc.on('error', …)` 写入 `spawnError`；`ensure()` 在轮询中**优先抛出该错误**，
+    由调用方 `safe()` 收成 `{ok:false, error: 'aria2c 启动失败（ENOENT）…请确认 aria2c 已安装并在 PATH'}`。
+  - **语义被补充（新不变量）**：**每个子进程调用点必须消费 `'error'` 事件**，且 daemon 必须满足
+    生命周期契约（`detached:true` + `stdio:'ignore'` + `unref()`）——由静态守卫机器锁住（尸体样本已取得）。
+  - **行为变更清单（唯一一处）**：环境缺失（`aria2c` 不存在）时，从「未捕获异常打崩 web」改为
+    「`ensure()` 抛显式错误 → 工具返回 `{ok:false,error}`」；**aria2c 正常存在时行为完全不变**。
+
+- **2026-09-14 · 逻辑可测试化（纯函数抽取，零行为变更）**
+  - **语义被确认**：`buildDaemonArgs`/`buildAddOptions`/`buildLimitOptions`/`buildRpcBody`/`rpcErrorMessage`/
+    `rpcBodyError`/`mapTask`/`mapGlobalStat`/`removeRpcMethod`/`fmtSize`/`fmtSpeed`/`shortGid` 从
+    `aria2.ts`/`index.ts` 搬入 `src/logic.ts`，逐条对齐原实现；`rpc()` 由 `res.json()` 改为 `res.text()` + 纯函数解析
+    （**语义等价**：合法 JSON 同结果，非 JSON body 同样回落 HTTP 状态文案，且不因读取 body 失败而新抛错）。
+  - **语义被补充（此前无人知道的真实语义）**：`fmtSize(NaN)='0 B'`（`!NaN` 为真）、`fmtSize(-1)='-1.0 B'`（不取绝对值）、
+    `mapTask` 的 `errorCode=0 → ''`（假值）、`mapTask.completed>total → progress>100`（不 clamp）、
+    `mapTask({files:{}})` 会抛 `TypeError`（脏类型，靠工具层 `safe()` 收口）、`buildLimitOptions(NaN)='NaNK'`、
+    `removeRpcMethod` 对未知状态按「活跃」处理（保守：真删任务而非仅清记录）。
+  - **语义被修正（我自己的预期错）**：首版断言 daemon argv 数量 `> 30`，实测 **29** —— 改预期为 `>= 25`
+    并把真实条数写进断言消息（**预期写错就改预期，不是改代码**）。
+  - **判据修正（守卫误报）**：静态扫描器首版用 `\bspawn\s*\(` 抓调用点，把 `this.spawn()` 与
+    `private spawn(): void` 也算成子进程调用 → 6 条误报。改为「首参必须是字符串字面量」后归零。
+    **教训：判据失真比缺陷更贵（假阳性成本 = 假阴性 × 调用点数）**——先修判据，再谈被测对象。
 
 - **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
   - 语义**被确认**：daemon detached 常驻 + 跨 web 重启复用；RPC 只回环 + token 持久化；`ensure()` 是所有工具的前置；`removeFiles` 是唯一破坏面。
@@ -167,7 +202,11 @@ src/aria2.ts  Aria2Client
 
 ## 10 · 未决问题
 
-- **U1 `seed=true` 语义疑似相反**：参数描述「完成后继续做种」，实现写入 `seed-time=0`（aria2 语义 = 完成后**不**做种）。倾向：`seed=true` 应写正数（如 `seed-time=60`）或删该参数。**需实测确认后由主人裁决**（本轮只记录，不动源码）。
+- **U1 `seed=true` 语义（2026-09-14 补课：已由单测**证伪为「空操作」**，修法待裁决）**：参数描述「完成后继续做种」，
+  实现写入 `seed-time=0`（aria2 语义 = 完成后**不**做种）。本轮进一步证明：该值与 daemon 全局的
+  `--seed-time=0` **逐字节相同** ⇒ `seed=true` 对行为**零影响**（既不是「继续做种」也不是「反向操作」，而是**没接线**）。
+  证据：`tests/logic.test.mjs:buildAddOptions` 的对照断言（A13）。
+  倾向：`seed=true` 应写正数（如 `seed-time=60`）或删除该参数；**需实测 aria2 语义后由主人裁决**（本轮不改行为）。
 - **U2 无 `download_shutdown`**：刻意不提供（防误杀 daemon）。是否需要一个「显式停止引擎」的带确认路径？倾向：保持不提供，需要时用 WSL/pwsh 手动。
 - **U3 `removeFiles` 的静默 catch**：单文件删除失败被吞（`catch { /* 忽略单个删除失败 */ }`），违反「不许静默」。倾向：把失败路径收集为 `failedDeletes[]` 回传。
 - **U4 daemon 无守护**：web 崩溃 → daemon 仍在，但若 daemon 自身崩溃，只有下一次工具调用才发现。倾向：不引入巡检（避免第二个 owner，见 §5.19）。

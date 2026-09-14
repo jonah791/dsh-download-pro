@@ -10,6 +10,9 @@ import { existsSync, readdirSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { Aria2Client } from './aria2.js'
+import {
+  fmtSize, fmtSpeed, shortGid, formatTaskLine, formatStoppedLine, isSupportedUrl, isValidAction,
+} from './logic.js'
 
 export const name = 'dsh-download-pro'
 export const inject = ['tools'] as const
@@ -29,23 +32,6 @@ export const Config = z.object({
   maxConcurrent: z.number().default(5),
   rpcSecret: z.string().default(''),
 })
-
-function fmtSize(n: number): string {
-  if (!n) return '0 B'
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`
-}
-
-function fmtSpeed(n: number): string {
-  return n > 0 ? `${fmtSize(n)}/s` : '--'
-}
-
-function shortGid(gid: string): string {
-  return gid.length > 8 ? gid.slice(0, 8) : gid
-}
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('download-pro')
@@ -92,7 +78,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: any) {
       const url = String(args.url ?? '').trim()
       if (!url) return { ok: false, error: 'url 必填' }
-      if (!/^(magnet:|https?:\/\/)/i.test(url)) return { ok: false, error: 'url 必须是 magnet: 磁力链或 http(s):// 链接' }
+      if (!isSupportedUrl(url)) return { ok: false, error: 'url 必须是 magnet: 磁力链或 http(s):// 链接' }
       const r = await safe(async () => {
         await aria2.ensure()
         const opts: any = {}
@@ -126,12 +112,10 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: any, v: any) => {
         if (!v.ok) return [{ type: 'text', text: v.error ?? '查询失败' }]
         const lines: string[] = []
-        const fmtTask = (t: any) => `[${shortGid(t.gid)}] ${t.name}  ${t.status === 'complete' ? '✔ 完成' : `${t.progress}%`}  ${fmtSize(t.completedLength)}/${fmtSize(t.totalLength)}  ↓${fmtSpeed(t.downloadSpeed)}`
+        const fmtTask = formatTaskLine
         const act = (v.active ?? []).map(fmtTask)
         const wait = (v.waiting ?? []).map(fmtTask)
-        const stop = (v.stopped ?? []).map((t: any) => t.status === 'complete'
-          ? `[${shortGid(t.gid)}] ${t.name}  ✔ 完成  ${fmtSize(t.totalLength)}`
-          : `[${shortGid(t.gid)}] ${t.name}  ✘ ${t.errorMessage ?? t.status}`)
+        const stop = (v.stopped ?? []).map(formatStoppedLine)
         if (act.length) lines.push('▼ 下载中', ...act.map((s: string, i: number) => `  ${i + 1}. ${s}`))
         if (wait.length) lines.push('▼ 等待', ...wait.map((s: string, i: number) => `  ${i + 1}. ${s}`))
         if (stop.length) lines.push('▼ 已结束', ...stop.map((s: string, i: number) => `  ${i + 1}. ${s}`))
@@ -221,7 +205,7 @@ export function apply(ctx: Context, config: Config): void {
       const gid = String(args.gid ?? '').trim()
       const action = String(args.action ?? '')
       if (!gid) return { ok: false, error: 'gid 必填' }
-      if (!['pause', 'resume', 'remove', 'force-remove'].includes(action)) return { ok: false, error: 'action 必须是 pause/resume/remove/force-remove' }
+      if (!isValidAction(action)) return { ok: false, error: 'action 必须是 pause/resume/remove/force-remove' }
       const r = await safe(async () => {
         await aria2.ensure()
         // pause/resume 前检查状态，对已结束任务给友好提示（aria2 会对 complete 任务 pause 报 400）
