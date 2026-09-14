@@ -4,6 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import {
   fmtSize, fmtSpeed, shortGid, formatTaskLine, formatStoppedLine,
   isSupportedUrl, isValidAction, VALID_ACTIONS,
@@ -224,7 +225,10 @@ test('mapTask: 正常路径——字段归一 + 进度四舍五入到 0.1%', () 
 
 test('mapTask: 名称回落链——bittorrent.info.name > 文件名 basename > gid', () => {
   assert.equal(mapTask({ gid: 'g', bittorrent: { info: { name: 'BT' } }, files: [{ path: 'D:\\d\\f.bin' }] }).name, 'BT')
-  assert.equal(mapTask({ gid: 'g', files: [{ path: 'D:\\d\\f.bin' }] }).name, 'f.bin')
+  // 真实语义：回落用宿主平台的 `path.basename` —— Windows 下 'D:\d\f.bin' → 'f.bin'，
+  // POSIX 下反斜杠不是分隔符 → 原样返回。故按宿主平台取期望值（生产跑在 Windows，行为正确）。
+  assert.equal(mapTask({ gid: 'g', files: [{ path: 'D:\\d\\f.bin' }] }).name, path.basename('D:\\d\\f.bin'))
+  assert.equal(mapTask({ gid: 'g', files: [{ path: '/var/tmp/f.bin' }] }).name, 'f.bin', 'POSIX 路径两种平台都成立')
   assert.equal(mapTask({ gid: 'g' }).name, 'g')
 })
 
