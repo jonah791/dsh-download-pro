@@ -1,0 +1,173 @@
+# 语义文档：dsh-download-pro（aria2 下载引擎操控面）
+
+| 项 | 值 |
+|----|----|
+| 能力名 | dsh-download-pro（插件内 `name = 'dsh-download-pro'`；组合行 id `agent-download-pro`） |
+| 主副本路径 | `self-plugins/dsh-download-pro/docs/semantic.md` |
+| 实现落点 | `self-plugins/dsh-download-pro/src/index.ts`（工具面）、`self-plugins/dsh-download-pro/src/aria2.ts`（RPC 客户端 + daemon 管理） |
+| 版本 | v0.1.1（package.json） |
+| 状态 | **draft**（补课文档，验收条目待线上复核） |
+| 依赖服务 | `inject = ['tools']` |
+| 外部依赖 | `aria2c` 可执行文件（detached 常驻进程）+ 本地 TCP 端口 `rpcPort`（默认 16880） |
+
+---
+
+## 1 · 定位与反定位
+
+**定位**：给模型一个**常驻的 aria2 下载引擎**（磁力 / BT / HTTP(S) 直链 / `.torrent`），并暴露 5 个工具
+完成「添加 → 观察 → 控制 → 限速」闭环；daemon 以 detached 进程存活，**web 重启不中断下载**。
+
+**反定位（本文不管什么）**：
+- 不管搜索与资源发现（那属于 `dsh-search-pro` 与技能 `search-resource-freshness`）——本插件拿到 URL 之后的**执行**环节
+- 不管文件内容识别/整理（下载完就是文件，落在 `dir` 里）
+- 不管 aria2c 的安装（README 明示 scoop/choco 自装；插件只 spawn）
+- **不是** 网盘客户端（不走百度/夸克 SDK），**不是** 浏览器下载管理器（无 UI、无右键集成）
+
+## 2 · 术语表
+
+| 术语 | 含义 |
+|------|------|
+| gid | aria2 任务标识，`download_add` 返回，后续 `status`/`control` 的句柄 |
+| daemon | 独立 detach 的 `aria2c` 进程；**生命周期独立于 web**（设计核心） |
+| token | RPC 认证串；RPC 参数首项恒为 `token:<secret>` |
+| ensure() | 「ping 不通就 spawn 并等就绪（40×500ms ≈ 20s）」的幂等前置动作，**每个工具调用前都执行** |
+| 端口隔离 | RPC 16880、BT/DHT 46000-47000 —— 全部避开 Windows 排除端口段 6644-7043 |
+| stopped 分流 | 已结束任务走 `removeDownloadResult`，活动任务走 `remove/forceRemove` |
+
+## 3 · 概念模型
+
+```
+模型（爱丽丝）
+  │  download_add / download_list / download_status / download_control / download_global
+  ▼
+src/index.ts  apply(ctx, config)
+  ├─ dataDir = ($DSH_HOME ?? ~/.dsh)/data/dsh-download-pro
+  ├─ new Aria2Client({rpcPort,dir,maxConcurrent,rpcSecret}, dataDir)
+  ├─ safe(fn)  ← 每个工具体包一层：异常 → {ok:false,error}（永不抛出）
+  └─ if (config.enabled) aria2.ensure()   ← web 启动即确保 daemon
+
+src/aria2.ts  Aria2Client
+  ├─ loadOrCreateSecret()  读/写 <dataDir>/token（16 字节 hex；写失败仅本次有效）
+  ├─ rpc(method, params)   POST http://127.0.0.1:<rpcPort>/jsonrpc，params[0]='token:<secret>'
+  │                        AbortSignal.timeout(15000)；HTTP 4xx → 提取 JSON-RPC error.message 抛出
+  ├─ ensure() → ping(aria2.getVersion) 失败则 spawn() → 轮询 40×500ms → 超时抛错
+  └─ spawn()  spawn('aria2c', [...args], {detached:true, stdio:'ignore'}) + unref()
+
+磁盘产物：<dataDir>/token（凭据）· <dataDir>/session（aria2 任务会话，--save-session-interval=60）
+下载落点：config.dir（默认 D:\桌面\下载）
+```
+
+不变量（invariants）：
+1. **I1 RPC 只回环**：`--rpc-listen-all=false` + 客户端恒连 `127.0.0.1`——不可被局域网访问（可 `netstat -ano | findstr :16880` 验证只 LISTEN 127.0.0.1）。
+2. **I2 每个工具调用前都 `ensure()`**：`grep -c "aria2.ensure()" src/index.ts` = 6（5 个工具各 1 + apply 内 1）。
+3. **I3 disconnect 不杀 daemon**：`apply` 的清理**不**调用 `shutdown()`——源码注释明示「否则重启即中断所有下载任务」。
+4. **I4 无裸抛**：所有工具体经 `safe()`；`ping()` 内部吞错返回 bool；`shutdown()` 吞错。
+5. **I5 端口不落陷阱区**：`rpcPort` 默认 16880、BT/DHT 46000-47000，均不在 6644-7043。
+
+## 4 · 契约
+
+### 4.1 配置（`Config` schema）
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | `true` | **被消费**：`apply` 末尾 `if (config.enabled) aria2.ensure()` |
+| `rpcPort` | `16880` | RPC 端口（不可用 6800：Windows 排除段） |
+| `dir` | `D:\桌面\下载` | 默认下载目录（`--dir`） |
+| `maxConcurrent` | `5` | 最大并发数（`--max-concurrent-downloads`） |
+| `rpcSecret` | `''` | 空 = 自动生成并持久化到 `<dataDir>/token` |
+
+### 4.2 落盘契约
+| 路径 | 形状 | 写入方式 / 读取语义 |
+|------|------|-------------------|
+| `<DSH_HOME>/data/dsh-download-pro/token` | 单行 hex 串 | `writeFileSync` 覆盖写；启动时读，非空即用；读失败则重新生成（**不删旧文件**） |
+| `<DSH_HOME>/data/dsh-download-pro/session` | aria2 会话文件 | 由 aria2c 自身按 60s 间隔写；用于跨重启恢复任务 |
+| `config.dir`（默认 `D:\桌面\下载`） | 下载产物 | aria2c 自身写；`download_control remove+removeFiles` 时插件会 `rmSync` 删除 |
+
+### 4.3 状态→裁决表
+| 输入状态 | 裁决 | 依据 |
+|---------|------|------|
+| `url` 不匹配 `^(magnet:\|https?://)` | `ok:false, error:'url 必须是 magnet: 磁力链或 http(s):// 链接'` | 输入前置校验 |
+| `ensure()` 20s 内未就绪 | `ok:false` + `aria2 守护进程启动超时（20s）` | 超时即失败，不静默 |
+| `action='pause'` 且任务 `complete/removed` | `ok:true` + `note:'任务已完成/移除，无需操作'`（**不调 RPC**） | 规避 aria2 HTTP 400 |
+| `action='pause'` 且已 `paused` / `resume` 且已 `active` | `ok:true` + `note:'任务已…'`（**不调 RPC**） | 幂等短路 |
+| `remove` 且任务 `complete/removed/error` | `aria2.removeDownloadResult` | aria2 语义分流 |
+| `remove` 且任务活动/等待/暂停 | `aria2.remove` / `aria2.forceRemove` | 同上 |
+| `removeFiles=true` | 先取 `files[].path` → remove → 逐个 `rmSync(force,recursive)` → 若父目录已空则删父目录 | 删目录仅当为空（防误删） |
+| `downloadLimit/uploadLimit` 均缺省 | `limitApplied:false`，只读统计 | 读路径不改状态 |
+| 任一参数 `<=0` 进限速 | 发送 `'0'` = 不限速 | aria2 语义 |
+
+### 4.4 调用点清单 `[MUST]`
+| 调用方 | 调用点（文件:符号） | 时机 |
+|-------|------------------|------|
+| web profile 组合 | `.dsh/profiles/web/cordis.patch.yml` 行 `id: agent-download-pro` / `name: dsh-download-pro`（无 config） | web 启动挂载 |
+| 插件本体 | `src/index.ts:apply` → `reg({name:'download_add'…})` / `'download_list'` / `'download_status'` / `'download_control'` / `'download_global'`（经局部 `reg = defineTool + ctx.tools.register`） | 挂载时注册 |
+| 插件本体 | `src/index.ts:apply` 末尾 → `if (config.enabled) aria2.ensure()` | web 启动即预热 daemon |
+| 5 个工具 | `src/index.ts:execute` → `safe(async () => { await aria2.ensure(); … })` | 每次调用 |
+| 全部 RPC | `src/aria2.ts:rpc()` → `POST http://127.0.0.1:${rpcPort}/jsonrpc`，methods：`aria2.getVersion` / `addUri` / `tellActive` / `tellWaiting` / `tellStopped` / `tellStatus` / `pause` / `unpause` / `remove` / `forceRemove` / `removeDownloadResult` / `getGlobalStat` / `changeGlobalOption` / `shutdown` | 按需 |
+| daemon 启动 | `src/aria2.ts:spawn()` → `spawn('aria2c', [...], {detached:true, stdio:'ignore'})` | ping 失败时 |
+| 凭据 | `src/aria2.ts:loadOrCreateSecret()` → `<dataDir>/token` | 构造 `Aria2Client` 时 |
+| 模型（爱丽丝） | 下载主链：`download_add` → `download_list`/`download_status` → `download_control` | 资源获取 |
+
+## 5 · 边界与信任
+
+- 能力边界 ≠ 沙箱：本插件能写入 `dir`、能 `rmSync(recursive)` 删除已下载文件与**其空的父目录**。删除面（destructive）是真实风险点——因此 `removeFiles` 默认 `false`，且只在显式传参时生效。
+- 不越界清单：不搜索资源；不解析种子内容；不上传（除 BT 做种，且默认 `--seed-time=0` 关闭）；不暴露 RPC 到局域网；不写 `dir` 之外的路径（除 `dataDir`）。
+- 失败面：
+  - RPC 失败 → `rpc()` 抛 `aria2: <message>` 或 `aria2 error <code>: <message>` → `safe()` 转 `{ok:false,error}`（**放行 + 报错**）。
+  - 凭据写失败 → 注释明示「不致命，仅本次会话有效」，**不阻塞**。
+  - `removeFiles` 单文件删除失败 → `catch {}` 忽略（其余文件继续删）——注意：此处是**静默**，与「不许静默」纪律相抵，见 §10 U3。
+
+## 6 · 与既有机制的关系
+
+- 与 **AGENTS.md §5.19（单点所有权）**：本插件是 **aria2 daemon 的唯一 owner**（唯一 spawn 者）；web 重启**不**释放它——重启期间所有权是「空窗」而非「转移」，需注意未来若出现第二个 spawn 者即成双 owner。
+- 与 **§5.10（预防性存活）**：daemon 不在 web 生命周期内，故 web 崩溃不影响下载；但也没有守护者替它保活（`ensure()` 是**每次调用时的补救**而非周期巡检）。
+- 与 **§5.11（组合变更必验证）**：改代码 → `pnpm build` → 预检须看到 `lib/index.js` mtime 前进。
+- 与 `dsh-search-pro`：搜索（发现）→ 本插件（下载）是前后工序。
+- 与 **daemon_restart**：重启 web 会重新 `ensure()`，daemon 已在则 ping 通过直接复用（**不重启下载**）。
+
+**生效判据（改代码后怎么证明真的生效）**：
+1. 构建产物新：`self-plugins/dsh-download-pro/lib/index.js` + `lib/aria2.js` 的 mtime **晚于**当前 web 进程启动时间。
+2. 工具面在场：本会话能列出 `download_add/list/status/control/global` 五个工具。
+3. 行为可答：`download_global` 返回真实统计（`numActive/numWaiting/numStoppedTotal`），而非 `{ok:false}`。
+4. 落盘产物：`<DSH_HOME>/data/dsh-download-pro/token` 存在且非空；daemon 在 `netstat -ano | findstr :16880` 中 LISTEN；`<dataDir>/session` 每 60s 被刷新（mtime 前进 = daemon 活着）。
+5. 反证：`ping` 通但 `aria2.getVersion` 返回的版本与 `aria2c --version` 不一致 ⇒ 你连上的是**另一个** aria2 实例（端口冲突），不是本插件拉起的。
+
+**回退**：`git revert` 最近提交 → `pnpm build` → 预检 → 哨兵重启 web。
+**数据面回退**：daemon 不停（可继续下载）；若要彻底停止 engine，需显式 `aria2.shutdown` RPC 或 `taskkill /IM aria2c.exe`（本插件**不提供** `download_shutdown` 工具——这是刻意的：防止一次误调用中断全部下载）。
+
+## 7 · 可证伪验收清单
+
+| # | 可证伪命题 | 证据（单测名/命令/日志行/HTTP） | 状态 |
+|---|-----------|------------------------------|------|
+| A1 | 工具面恰好 5 个 `download_*` | `grep -c "name: 'download_" src/index.ts` = 5 | 待验收 |
+| A2 | 每个工具调用前 ensure | `grep -c "aria2.ensure()" src/index.ts` = 6 | 待验收 |
+| A3 | RPC 只回环 | `netstat -ano \| findstr :16880` 只出现 `127.0.0.1:16880` | 待验收 |
+| A4 | 凭据持久化 | 删 `token` → 调 `download_global`（重新生成）→ 重启 web → token 内容不变 | 待验收 |
+| A5 | web 重启不中断下载 | 加一个大磁力任务 → `daemon_restart` → `download_list` 显示同一 gid 仍在 active，进度不回退 | 待验收 |
+| A6 | pause 已完成任务不报错 | 对 `complete` gid 调 `download_control action=pause` → `ok:true` + `note` 含「已完成」 | 待验收 |
+| A7 | removeFiles 删文件且只删空目录 | 造一个单文件任务 → `remove+removeFiles=true` → 文件消失；若目录内另有他文件则目录保留 | 待验收 |
+| A8 | 非法 url 被拒 | `download_add url=ftp://x` → `ok:false` 且 error 明示 `magnet:`/`http(s)://` | 待验收 |
+| A9 | 限速 0 = 不限 | `download_global downloadLimit=0` → aria2 返回该任务 `max-overall-download-limit:0` | 待验收（需 RPC 直查） |
+
+## 8 · 与实现的关系
+
+- 主实现：`src/index.ts`（313 行，工具面 + `safe()` + 删除逻辑）、`src/aria2.ts`（271 行，RPC 客户端 + daemon 管理 + 任务映射）。
+- 同语义副本：无。aria2 自身的 `--option` 语义不在本文管辖。
+- 未实现/未验证部分**显式标注**：
+  - **无 `tests/`**：A1–A9 全部待验收。
+  - `spawn()` 的 30+ 个 aria2 参数（BT tracker 列表、DHT entry point、`--bt-max-peers=300`、`--split=16` …）是**经验值**，无单测覆盖；其效果只能由实际下载成功率观察（属「经验参数」而非契约）。
+  - 工具 `download_add` 的 `seed=true` 分支写 `options['seed-time']='0'`，而 spawn 全局已含 `--seed-time=0`——**语义疑似相反**（aria2 中 `seed-time=0` = 完成后不做种），见 §10 U1。
+
+## 9 · 实践修订记录
+
+- **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
+  - 语义**被确认**：daemon detached 常驻 + 跨 web 重启复用；RPC 只回环 + token 持久化；`ensure()` 是所有工具的前置；`removeFiles` 是唯一破坏面。
+  - 语义**被补充**：`<DSH_HOME>/data/dsh-download-pro/token` 与 `session` 两个落盘点（此前只在源码里）；`apply` 末尾会**主动预热 daemon**（`config.enabled` 真的被消费，与 cyber-range 的 `enabled` 死配置形成对照）。
+  - 语义**被修正**：无（首次成文）。
+  - 教训：同一生态内「配置字段是否被消费」并不一致——语义文档必须逐字段写「谁读它」，否则读者会把 `enabled`/`defaultResolveIp` 这类字段的效力一概而论。
+
+## 10 · 未决问题
+
+- **U1 `seed=true` 语义疑似相反**：参数描述「完成后继续做种」，实现写入 `seed-time=0`（aria2 语义 = 完成后**不**做种）。倾向：`seed=true` 应写正数（如 `seed-time=60`）或删该参数。**需实测确认后由主人裁决**（本轮只记录，不动源码）。
+- **U2 无 `download_shutdown`**：刻意不提供（防误杀 daemon）。是否需要一个「显式停止引擎」的带确认路径？倾向：保持不提供，需要时用 WSL/pwsh 手动。
+- **U3 `removeFiles` 的静默 catch**：单文件删除失败被吞（`catch { /* 忽略单个删除失败 */ }`），违反「不许静默」。倾向：把失败路径收集为 `failedDeletes[]` 回传。
+- **U4 daemon 无守护**：web 崩溃 → daemon 仍在，但若 daemon 自身崩溃，只有下一次工具调用才发现。倾向：不引入巡检（避免第二个 owner，见 §5.19）。
