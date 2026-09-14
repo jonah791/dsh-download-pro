@@ -4,3 +4,6 @@ lib/
 .DS_Store
 .env
 
+
+*.bak
+*.bak-*
