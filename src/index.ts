@@ -23,6 +23,8 @@ export interface Config {
   dir: string
   maxConcurrent: number
   rpcSecret: string
+  /** `download_add seed:true` 的做种分钟数（缺省 1440=24h；**必须 >0**——0 = 停止做种） */
+  seedTimeMinutes: number
 }
 
 export const Config = z.object({
@@ -31,6 +33,7 @@ export const Config = z.object({
   dir: z.string().default('D:\\桌面\\下载'),
   maxConcurrent: z.number().default(5),
   rpcSecret: z.string().default(''),
+  seedTimeMinutes: z.number().default(1440),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -63,7 +66,7 @@ export function apply(ctx: Context, config: Config): void {
       url: { type: 'string', required: true, description: '下载地址：magnet:?xt=urn:btih:... 磁力链 或 http(s):// 直链或种子链接' },
       dir: { type: 'string', description: '覆盖默认下载目录（默认 D:\\桌面\\下载）' },
       name: { type: 'string', description: '重命名（仅 HTTP 直链生效；磁力/BT 用种子内名称）' },
-      seed: { type: 'boolean', description: '完成后继续做种（默认 false=下载完即停）' },
+      seed: { type: 'boolean', description: 'true=下载完成后继续做种（做种 config.seedTimeMinutes 分钟，缺省 1440=24h）；缺省/false=下载完即停（daemon 全局 --seed-time=0）' },
     },
     output: {
       schema: {
@@ -84,7 +87,7 @@ export function apply(ctx: Context, config: Config): void {
         const opts: any = {}
         if (args.dir) opts.dir = String(args.dir)
         if (args.name) opts.out = String(args.name)
-        if (args.seed) opts.seed = true
+        if (args.seed) { opts.seed = true; opts.seedTimeMinutes = config.seedTimeMinutes }
         const gid = await aria2.add([url], opts)
         const t = await aria2.status(gid)
         return { gid, name: t.name, status: t.status, dir: t.dir || String(args.dir ?? '') || config.dir }
@@ -104,6 +107,7 @@ export function apply(ctx: Context, config: Config): void {
         type: 'object', additionalProperties: false,
         properties: {
           ...baseProps,
+          daemonStarted: { type: 'boolean' },
           active: { type: 'array', items: { type: 'object', additionalProperties: true } },
           waiting: { type: 'array', items: { type: 'object', additionalProperties: true } },
           stopped: { type: 'array', items: { type: 'object', additionalProperties: true } },
@@ -119,15 +123,18 @@ export function apply(ctx: Context, config: Config): void {
         if (act.length) lines.push('▼ 下载中', ...act.map((s: string, i: number) => `  ${i + 1}. ${s}`))
         if (wait.length) lines.push('▼ 等待', ...wait.map((s: string, i: number) => `  ${i + 1}. ${s}`))
         if (stop.length) lines.push('▼ 已结束', ...stop.map((s: string, i: number) => `  ${i + 1}. ${s}`))
-        if (!lines.length) return [{ type: 'text', text: '当前无任务' }]
-        return [{ type: 'text', text: lines.join('\n') }]
+        const warn = v.daemonStarted
+          ? '⚠ aria2 daemon 此前**不可达**，本次已（重新）拉起——若你并未主动停止过它，说明它中途退出过（本插件**无后台巡检**，只在工具入口 ensure）'
+          : ''
+        if (lines.length === 0) return [{ type: 'text', text: warn === '' ? '当前无任务' : warn }]
+        return [{ type: 'text', text: (warn === '' ? '' : warn + '\n') + lines.join('\n') }]
       },
     },
     async execute() {
       const r = await safe(async () => {
-        await aria2.ensure()
+        const { started } = await aria2.ensure()
         const [active, waiting, stopped] = await Promise.all([aria2.active(), aria2.waiting(), aria2.stopped()])
-        return { active, waiting, stopped }
+        return { active, waiting, stopped, daemonStarted: started }
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, ...r.value }

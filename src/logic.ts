@@ -111,16 +111,22 @@ export function buildDaemonArgs(cfg: DaemonConfig, secret: string, dataDir: stri
   ]
 }
 
+/** 默认做种时长（分钟）= 24h。**不可用 0**：aria2 语义里 `--seed-time=0` = 下载完**停止**做种。 */
+export const DEFAULT_SEED_MINUTES = 1440
+
 /** `aria2.addUri` 的可选参数。
- *  ⚠️ 已知缺陷（2026-09-14 证伪登记，未修）：`seed:true` 分支写入 `seed-time='0'`，
- *  而 daemon 全局已是 `--seed-time=0`（aria2 语义：0 = 下载完**停止**做种）——
- *  与参数文案「完成后继续做种」**相反**，且与不传该参数**逐字节等价 = 空操作**。 */
-export function buildAddOptions(opts: { dir?: string; out?: string; seed?: boolean }): Record<string, string> {
+ *  **2026-09-14 修复（原为已证伪缺陷）**：`seed:true` 曾写入 `seed-time='0'`——与参数文案
+ *  「完成后继续做种」**相反**（aria2: 0 = 停止做种），且与 daemon 全局 `--seed-time=0` 逐字节相同
+ *  ⇒ **空操作**。现改为写入**正的做种分钟数**（必须覆盖 daemon 全局值才有效果）；
+ *  非正数/非有限数一律回落 `DEFAULT_SEED_MINUTES`（绝不让 0 漏进去，那正是原来的反义 bug）。 */
+export function buildAddOptions(opts: { dir?: string; out?: string; seed?: boolean; seedTimeMinutes?: number }): Record<string, string> {
   const options: Record<string, string> = {}
   if (opts.dir) options.dir = opts.dir
   if (opts.out) options.out = opts.out
-  if (opts.seed) {
-    options['seed-time'] = '0'
+  if (opts.seed === true) {
+    const raw = opts.seedTimeMinutes
+    const minutes = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SEED_MINUTES
+    options['seed-time'] = String(minutes)
     options['bt-seed-unverified'] = 'true'
   }
   return options

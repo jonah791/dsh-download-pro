@@ -74,6 +74,7 @@ src/aria2.ts  Aria2Client
 | `dir` | `D:\桌面\下载` | 默认下载目录（`--dir`） |
 | `maxConcurrent` | `5` | 最大并发数（`--max-concurrent-downloads`） |
 | `rpcSecret` | `''` | 空 = 自动生成并持久化到 `<dataDir>/token` |
+| `seedTimeMinutes` | `1440` | **被消费**：`download_add seed:true` 时的做种分钟数（单任务 `seed-time`，覆盖 daemon 全局值）。**必须 >0**——aria2 里 `--seed-time=0` = **停止**做种，故 0 属反义值，非法输入（0/负/NaN/Infinity/非数）一律回落默认 |
 
 ### 4.2 落盘契约
 | 路径 | 形状 | 写入方式 / 读取语义 |
@@ -110,7 +111,7 @@ src/aria2.ts  Aria2Client
 ## 5 · 边界与信任
 
 - 能力边界 ≠ 沙箱：本插件能写入 `dir`、能 `rmSync(recursive)` 删除已下载文件与**其空的父目录**。删除面（destructive）是真实风险点——因此 `removeFiles` 默认 `false`，且只在显式传参时生效。
-- 不越界清单：不搜索资源；不解析种子内容；不上传（除 BT 做种，且默认 `--seed-time=0` 关闭）；不暴露 RPC 到局域网；不写 `dir` 之外的路径（除 `dataDir`）。
+- 不越界清单：不搜索资源；不解析种子内容；不上传（除 BT 做种：**默认关闭**，仅当 `download_add seed:true` 时按 `seedTimeMinutes` 做种）；不暴露 RPC 到局域网；不写 `dir` 之外的路径（除 `dataDir`）。
 - 失败面：
   - RPC 失败 → `rpc()` 抛 `aria2: <message>` 或 `aria2 error <code>: <message>` → `safe()` 转 `{ok:false,error}`（**放行 + 报错**）。
   - 凭据写失败 → 注释明示「不致命，仅本次会话有效」，**不阻塞**。
@@ -150,8 +151,9 @@ src/aria2.ts  Aria2Client
 | A10 | spawn 失败不再打崩宿主（未处理 `'error'` 事件） | `npm test` → `tests/spawn-contract.test.mjs`：**尸体测试**用真实子进程证明「spawn 失败 + 无监听器 = 非零退出 + ENOENT」，对照测试证明「注册监听器 = 不崩」；静态守卫要求每个 `spawn('…'` 调用点消费 `'error'` | **已实测（2026-09-14，44/44 pass）** |
 | A11 | daemon argv 的安全与生命周期不变量 | `npm test` → `tests/logic.test.mjs:buildDaemonArgs`：`--rpc-listen-all=false` 必在、secret 透传、DHT/BT 监听端口不在 Windows 排除段 6644-7043、`--save-session` 路径**不含反斜杠**、每个 argv 元素独立（不拼 shell 串） | **已实测（2026-09-14）** |
 | A12 | 纯逻辑有失败/退化路径覆盖 | `npm test` → `tests/logic.test.mjs` 30 例：0/NaN/负数/Infinity 格式化、脏类型（`files:{}`）、缺字段、空 secret、`errorCode=0`、未知 action、非 JSON RPC body 等 | **已实测（2026-09-14）** |
-| A13 | `seed=true` 是空操作（原「语义相反」猜想被证实并加强） | `npm test` → 断言 `buildAddOptions({seed:true})['seed-time']` 与 daemon 的 `--seed-time=0` **逐字节相同** → 对行为零影响 | **已实测（2026-09-14）** |
+| A13 | **已修（2026-09-15）**：`seed=true` 写正做种分钟数，必须与 daemon 全局 `--seed-time=0` **不同**（修复前二者逐字节相同 = 空操作） | `npm test` → `buildAddOptions({seed:true})['seed-time'] === String(DEFAULT_SEED_MINUTES)` 且 `!==` daemon 全局值；非法 `seedTimeMinutes` 回落默认 | **已实测（2026-09-15）** |
 | A14 | `logic.ts` 保持纯逻辑（可离线单测） | `npm test` → 断言 `src/logic.ts` 不含 `child_process`、不含 `fetch(` | **已实测（2026-09-14）** |
+| A15 | **daemon 死亡可见**（2026-09-15 新增）：`download_list` 区分「本来就活着」与「本次刚被拉起」 | 源码级守卫断言 `aria2.ts:ensure` 返回 `{started}` 且 `index.ts` 把 `daemonStarted: started` 透出到输出；线上调用返回 `daemonStarted:false`（daemon 常驻） | **已实测（2026-09-15）** |
 
 ## 8 · 与实现的关系
 
@@ -160,9 +162,15 @@ src/aria2.ts  Aria2Client
 - 未实现/未验证部分**显式标注**：
   - **单测（2026-09-14 补课已补）**：`tests/logic.test.mjs`（30）+ `tests/spawn-contract.test.mjs`（14）= **44/44 全过**；`npm test` 一条命令可复跑。A1–A9 仍需**真实 aria2 daemon** 的线上验收（离线单测不能替代）。
   - `spawn()` 的 29 条 aria2 参数（BT tracker 列表、DHT entry point、`--bt-max-peers=300`、`--split=16` …）是**经验值**：其**拼装正确性**现已被单测锁住（A11），但**效果**只能由实际下载成功率观察（属「经验参数」而非契约）。
-  - 工具 `download_add` 的 `seed=true` 分支写 `options['seed-time']='0'`，而 spawn 全局已含 `--seed-time=0`——**已由单测证伪为「空操作」**（不是「做种」也不是「相反」，而是**零影响**），见 §10 U1。
+  - ~~工具 `download_add` 的 `seed=true` 分支写 `options['seed-time']='0'`，而 spawn 全局已含 `--seed-time=0`——**已由单测证伪为「空操作」**（不是「做种」也不是「相反」，而是**零影响**），见 §10 U1。~~ **已修（2026-09-15）**：`seed=true` 改为写**正的做种分钟数**（`config.seedTimeMinutes`，缺省 1440），非法值一律回落默认；见 §9 与 §10 U1（已闭环）。
 
 ## 9 · 实践修订记录
+
+- **2026-09-15 · 修「已证伪待裁决」的 `seed` 反义缺陷 + 让 daemon 死亡可见（`t-490458d8` 第 2 组）**
+  - **① `seed=true` 从「空操作」修成真做种**：原实现写 `seed-time='0'`（aria2 语义 = 下载完**停止**做种），与参数文案「完成后继续做种」**相反**，且与 daemon 全局 `--seed-time=0` 逐字节相同 ⇒ **对行为零影响**。修法取 §10 U1 自己列的首选：**写正数** —— 新增 `Config.seedTimeMinutes`（缺省 `1440` = 24h），经 `download_add` → `aria2.add` → `buildAddOptions` 透传为单任务 `seed-time`（单任务值**覆盖** daemon 全局值才有效果）；非法输入（0/负/NaN/Infinity/非数）**一律回落默认**——0 是反义值，绝不能漏进去。`bt-seed-unverified` 保留（只在真做种时有意义）。
+  - **② 判据守卫**：`tests/logic.test.mjs` 把「已证伪」那条哨兵翻成修复断言——`seed:true` 的 `seed-time` **必须不等于** daemon 全局值（原来的等值断言正是缺陷的机器指纹）；另加两条边界（非法值回落、`seed` 非严格 true 不产键）。
+  - **③ daemon 死亡可见**：`ensure()` 现返回 `{started}`（`true` = 本次**新拉起**了 daemon），`download_list` 透出 `daemonStarted` 并在 `true` 时打印告警行「此前不可达、本次已（重新）拉起——若你并未主动停止过它，说明它中途退出过」。**这不是巡检**（刻意不引入第二个 owner，见 §5.19/U4），而是把「本来就活着」与「刚被我拉起」这两个此前无法区分的情形**变得可区分**——否则 daemon 中途死亡在下一次工具调用里也看不出痕迹（D10 形状：新判据若对既存情形恒空，等于假修复）。
+  - **④ 同步**：§4.1 配置表 + §5 不越界清单 + §7（A13 改判、新增 A15）+ §8 + §10 U1/U4 + `tests/spawn-contract.test.mjs` 源码守卫。
 
 - **2026-09-14 · 进程崩溃缺陷：spawn 失败无 `'error'` 监听器 → 打崩宿主 web（已修 + 加机器守卫）**
   - **症状**：`src/aria2.ts:spawn()` 用 `spawn('aria2c', args, …)` 拉起 daemon，**从未注册 `'error'` 监听器**。
@@ -206,11 +214,8 @@ src/aria2.ts  Aria2Client
 
 ## 10 · 未决问题
 
-- **U1 `seed=true` 语义（2026-09-14 补课：已由单测**证伪为「空操作」**，修法待裁决）**：参数描述「完成后继续做种」，
-  实现写入 `seed-time=0`（aria2 语义 = 完成后**不**做种）。本轮进一步证明：该值与 daemon 全局的
-  `--seed-time=0` **逐字节相同** ⇒ `seed=true` 对行为**零影响**（既不是「继续做种」也不是「反向操作」，而是**没接线**）。
-  证据：`tests/logic.test.mjs:buildAddOptions` 的对照断言（A13）。
-  倾向：`seed=true` 应写正数（如 `seed-time=60`）或删除该参数；**需实测 aria2 语义后由主人裁决**（本轮不改行为）。
+- ~~**U1 `seed=true` 语义**：参数描述「完成后继续做种」，实现写入 `seed-time=0`（= 完成后**不**做种），且与 daemon 全局 `--seed-time=0` 逐字节相同 ⇒ 对行为**零影响**（没接线）。~~ → **已闭环（2026-09-15）**：取本条目首选方案（写正数）——新增 `Config.seedTimeMinutes`（缺省 1440），单任务 `seed-time` 覆盖 daemon 全局值；非法值回落默认；哨兵断言翻转为「必须不等于全局值」。见 §9、§7 A13。
 - **U2 无 `download_shutdown`**：刻意不提供（防误杀 daemon）。是否需要一个「显式停止引擎」的带确认路径？倾向：保持不提供，需要时用 WSL/pwsh 手动。
 - **U3 `removeFiles` 的静默 catch**：单文件删除失败被吞（`catch { /* 忽略单个删除失败 */ }`），违反「不许静默」。倾向：把失败路径收集为 `failedDeletes[]` 回传。
-- **U4 daemon 无守护**：web 崩溃 → daemon 仍在，但若 daemon 自身崩溃，只有下一次工具调用才发现。倾向：不引入巡检（避免第二个 owner，见 §5.19）。
+- **U4 daemon 无守护**：web 崩溃 → daemon 仍在，但若 daemon 自身崩溃，只有下一次工具调用才发现。倾向：**不引入巡检**（避免第二个 owner，见 §5.19）。
+  → **部分闭环（2026-09-15）**：不加巡检（判断不变），但让「下一次工具调用」**看得出**发生过崩溃——`ensure()` 返回 `{started}`、`download_list` 透出 `daemonStarted` 并告警（见 §9-③、§7 A15）。仍缺：daemon 死亡期间**在飞的下载**无人接管（要真恢复需巡检/重启，属刻意不做）。

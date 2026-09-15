@@ -8,7 +8,7 @@ import path from 'node:path'
 import {
   fmtSize, fmtSpeed, shortGid, formatTaskLine, formatStoppedLine,
   isSupportedUrl, isValidAction, VALID_ACTIONS,
-  buildDaemonArgs, buildAddOptions, buildLimitOptions,
+  buildDaemonArgs, buildAddOptions, buildLimitOptions, DEFAULT_SEED_MINUTES,
   buildRpcBody, rpcErrorMessage, rpcBodyError,
   mapTask, mapGlobalStat, removeRpcMethod, describeSpawnFailure,
 } from '../lib/logic.js'
@@ -144,15 +144,32 @@ test('buildAddOptions: 退化路径——空串 dir/out 不产生选项；seed=f
   assert.deepEqual(buildAddOptions({ seed: false }), {})
 })
 
-test('buildAddOptions: 已证伪的缺陷——seed:true 写入的 seed-time 与 daemon 全局默认**完全相同 = 空操作**', () => {
+test('buildAddOptions: **已修**（2026-09-14）——seed:true 写入正的做种分钟数，必须与 daemon 全局值不同', () => {
   const perTask = buildAddOptions({ seed: true })
   const daemon = buildDaemonArgs(CFG, 's', '/tmp/d')
-  assert.equal(perTask['seed-time'], '0')
-  assert.ok(daemon.includes('--seed-time=0'), 'daemon 全局已是 seed-time=0')
-  // 证伪：参数文案承诺「完成后继续做种」，但 aria2 语义中 --seed-time=0 = 下载完**停止**做种，
-  // 且逐任务值与全局值逐字节相同 ⇒ 该分支对行为**零影响**（不是「继续做种」）。
-  assert.equal(perTask['seed-time'], daemon.find((a) => a.startsWith('--seed-time=')).slice('--seed-time='.length),
-    'seed:true 未改变任何有效配置 → 空操作（已在语义文档 §9/§10 登记，需裁决如何修）')
+  const globalSeed = daemon.find((a) => a.startsWith('--seed-time=')).slice('--seed-time='.length)
+  assert.equal(globalSeed, '0', 'daemon 全局仍是 seed-time=0（默认「下载完即停」）')
+  assert.equal(perTask['seed-time'], String(DEFAULT_SEED_MINUTES))
+  assert.equal(perTask['bt-seed-unverified'], 'true')
+  // 修复前的反义 bug：逐任务值与全局值**逐字节相同** ⇒ 空操作、且语义与文案相反。
+  assert.notEqual(perTask['seed-time'], globalSeed, 'seed:true 必须真的改变有效配置（覆盖全局 0）')
+  assert.equal(buildAddOptions({ seed: true, seedTimeMinutes: 30 })['seed-time'], '30', '可配做种时长')
+})
+
+test('退化：seed:true 喂非法 seedTimeMinutes（0/负数/NaN/Infinity/非数）→ 一律回落默认，绝不放 0 进去', () => {
+  for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, '60', null, undefined]) {
+    const o = buildAddOptions({ seed: true, seedTimeMinutes: bad })
+    assert.equal(o['seed-time'], String(DEFAULT_SEED_MINUTES), `${String(bad)} 应回落默认`)
+    assert.notEqual(o['seed-time'], '0', '0 = 停止做种，与原 bug 同义，必须挡掉')
+  }
+})
+
+test('退化：seed 非严格 true（false/缺省/1/"true"）→ 不产生任何 seed 键', () => {
+  for (const v of [false, undefined, 1, 'true']) {
+    const o = buildAddOptions({ seed: v })
+    assert.equal('seed-time' in o, false, `seed=${String(v)} 不应产生 seed-time`)
+    assert.equal('bt-seed-unverified' in o, false)
+  }
 })
 
 /* ── 全局限速 ── */

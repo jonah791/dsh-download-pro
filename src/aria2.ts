@@ -87,15 +87,17 @@ export class Aria2Client {
 
   /** 确保 daemon 存活：ping 不通则 spawn 并等待就绪。
    *  spawn 层失败（`aria2c` 不在 PATH）不再打成未捕获异常——改为**显式抛错**，
-   *  由调用方 `safe()` 收成 `{ok:false, error}`（失败必须说清下一步动作）。 */
-  async ensure(): Promise<void> {
-    if (await this.ping()) return
+   *  由调用方 `safe()` 收成 `{ok:false, error}`（失败必须说清下一步动作）。
+   *  @returns `{ started }`：本次调用是否**真的拉起了** daemon（`false` = 调用前就已可达）。
+   *    供 `download_list` 提示「daemon 曾不可达」——本插件无后台巡检，只在工具入口 ensure。 */
+  async ensure(): Promise<{ started: boolean }> {
+    if (await this.ping()) return { started: false }
     this.spawnError = null
     this.spawn()
     for (let i = 0; i < 40; i++) {
       await new Promise((r) => setTimeout(r, 500))
       if (this.spawnError) throw new Error(this.spawnError)
-      if (await this.ping()) return
+      if (await this.ping()) return { started: true }
     }
     if (this.spawnError) throw new Error(this.spawnError)
     throw new Error('aria2 守护进程启动超时（20s）')
@@ -122,7 +124,7 @@ export class Aria2Client {
   }
 
   // ── 任务操作 ──
-  async add(uris: string[], opts: { dir?: string; out?: string; seed?: boolean } = {}): Promise<string> {
+  async add(uris: string[], opts: { dir?: string; out?: string; seed?: boolean; seedTimeMinutes?: number } = {}): Promise<string> {
     return await this.rpc<string>('aria2.addUri', [uris, buildAddOptions(opts)])
   }
 

@@ -115,3 +115,12 @@ test('真实源码：纯逻辑层不得含子进程/网络调用（保持可离�
   assert.ok(!/child_process/.test(logic), 'logic.ts 不得引入 child_process')
   assert.ok(!/\bfetch\s*\(/.test(logic), 'logic.ts 不得发起网络请求')
 })
+
+test('真实源码：daemon 存活状态必须可区分「本来就活着」与「刚被拉起」（否则死亡永久不可见）', () => {
+  const aria2 = readFileSync(join(srcDir, 'aria2.ts'), 'utf8')
+  assert.match(aria2, /async ensure\(\): Promise<\{ started: boolean \}>/,
+    'ensure 必须返回 { started }：调用方要能区分「ping 通」与「本次拉起来了」')
+  const idx = readFileSync(join(srcDir, 'index.ts'), 'utf8')
+  assert.match(idx, /daemonStarted: started/,
+    'download_list 必须把 started 透出到输出（否则该信息在工具面不可见 = 等于没有）')
+})
