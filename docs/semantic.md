@@ -112,6 +112,7 @@ src/aria2.ts  Aria2Client
 
 - 能力边界 ≠ 沙箱：本插件能写入 `dir`、能 `rmSync(recursive)` 删除已下载文件与**其空的父目录**。删除面（destructive）是真实风险点——因此 `removeFiles` 默认 `false`，且只在显式传参时生效。
 - 不越界清单：不搜索资源；不解析种子内容；不上传（除 BT 做种：**默认关闭**，仅当 `download_add seed:true` 时按 `seedTimeMinutes` 做种）；不暴露 RPC 到局域网；不写 `dir` 之外的路径（除 `dataDir`）。
+- **daemon 进程形态（2026-09-17 实测，防误报）**：aria2c 在本机呈**两进程**形态——插件 spawn 的父进程（其父 = web 进程）+ **它自建的子进程**（命令行走 aria2 安装全路径，**持 RPC 端口**）。**两进程 ≠ 双 daemon**：唯一 owner 判据 = `Get-NetTCPConnection -LocalPort 16880` 的 `OwningProcess`。据此避免把正常形态误读为「重复拉起」（对照 §5.19 单点所有权）。
 - 失败面：
   - RPC 失败 → `rpc()` 抛 `aria2: <message>` 或 `aria2 error <code>: <message>` → `safe()` 转 `{ok:false,error}`（**放行 + 报错**）。
   - 凭据写失败 → 注释明示「不致命，仅本次会话有效」，**不阻塞**。
