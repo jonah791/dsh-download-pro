@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-download-pro"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-44%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-47%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：给 agent 一个 **aria2 RPC 操控面**——磁力链 / BT 种子 / HTTP 直链的添加、查询、暂停、移除、全局限速，五个工具搞定。
